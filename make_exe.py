@@ -9,6 +9,8 @@ import numpy as np
 from PIL import Image, ImageTk
 import io  # For handling byte streams
 import torch
+import webbrowser
+
 def remove_red_pixels(input_pdf, output_pdf, progress_callback):
     doc = fitz.open(input_pdf)
     new_doc = fitz.Document()
@@ -112,6 +114,12 @@ def preview_pdf_page(pdf_path):
     doc.close()
     return img
 
+import tkinter as tk
+from tkinter import ttk, filedialog
+from PIL import Image, ImageTk
+import threading
+import os
+import time
 
 class PDFRedRemoverApp(tk.Tk):
     def __init__(self):
@@ -119,53 +127,105 @@ class PDFRedRemoverApp(tk.Tk):
         self.title('PDF Mute')
         self.geometry('1150x600')
 
+        # Color Palette
+        self.bg_color = "#f2f2f2"  # Light gray background
+        self.button_color = "#00a884"  # Teal for buttons
+        self.button_hover_color = "#00876c"  # Darker teal on hover
+        self.red_color = "#ff4d4d"  # Red for active state
+
+        # Configure Style
         style = ttk.Style()
-        style.theme_use("classic")
-        style.configure("TButton", font=("Helvetica", 12), padding=10)  # Default button style
-        style.configure("TLabel", font=("Helvetica", 14))
-        style.configure("Horizontal.TProgressbar", troughcolor="#EEEEEE", background="#007BFF")
+        style.theme_use("clam")
 
+        # Customize Button Style
+        style.configure("TButton", font=("Helvetica", 14), padding=10,
+                        background=self.button_color, foreground="white",
+                        borderradius=5)
 
-        control_frame = Frame(self)
+        # Configure Label Style
+        style.configure("TLabel", font=("Helvetica", 12))
+
+        # Main Frames
+        control_frame = tk.Frame(self, bg=self.bg_color)
         control_frame.pack(fill='x', padx=20, pady=10)
-
-        preview_frame = Frame(self)
+        preview_frame = tk.Frame(self, bg=self.bg_color)
         preview_frame.pack(fill='both', expand=True, padx=20, pady=10)
 
-        # Adding algorithm selection radio buttons
+        # Algorithm selection frame
+        algorithm_frame = tk.Frame(control_frame, bg=self.bg_color)
+        algorithm_frame.pack(side='left', padx=10)
+
+        selection_label = tk.Label(algorithm_frame, text="Pick an Algorithm:", background=self.bg_color, font=("Helvetica", 12))
+        selection_label.pack(side='top', padx=10, pady=(0, 10))  # Add some padding to separate from the radio buttons
+
+        # Algorithm selection radio buttons with labels
         self.algorithm = tk.StringVar()
-        cpu_button = ttk.Radiobutton(control_frame, text='CPU Based', value='CPU', variable=self.algorithm)
-        gpu_button = ttk.Radiobutton(control_frame, text='GPU Based', value='GPU', variable=self.algorithm)
-        cpu_button.pack(side='left', padx=(10, 20))
-        gpu_button.pack(side='left')
+        cpu_button = ttk.Radiobutton(algorithm_frame, text='CPU', value='CPU', variable=self.algorithm)
+        cpu_label = ttk.Label(algorithm_frame, text='- Slow and High quality result', background=self.bg_color)
+        gpu_button = ttk.Radiobutton(algorithm_frame, text='GPU', value='GPU', variable=self.algorithm)
+        gpu_label = ttk.Label(algorithm_frame, text='- Fast and Low quality result', background=self.bg_color)
+        about_button = tk.Button(algorithm_frame, text='About', command=self.show_about, font=('Helvetica', 12, 'bold'), bg=self.bg_color)
+
+
+        cpu_button.pack(anchor='w')
+        cpu_label.pack(anchor='w')
+        gpu_button.pack(anchor='w')
+        gpu_label.pack(anchor='w')
+        about_button.pack(side='top', pady=(10, 0))  # Positioned at the top of the frame, under the radio buttons
+
         self.algorithm.set('CPU')  # Default selection
 
-        self.load_button = Button(control_frame, text='Load PDF', command=self.load_pdf)
+        # Buttons
+        self.load_button = tk.Button(control_frame, text='Load PDF', command=self.load_pdf)
         self.load_button.pack(side='left', padx=(10, 20))
-
-        self.save_button = Button(control_frame, text='Save as PDF', command=self.set_output, state='disabled')
+        self.save_button = tk.Button(control_frame, text='Save as PDF', command=self.set_output, state='disabled')
         self.save_button.pack(side='left')
 
-        self.go_button = Button(control_frame, text='Go', command=self.process_pdf, state='disabled')
+        # Go Button with Color Change
+        self.go_button = tk.Button(control_frame, text='Go', command=self.process_pdf,
+                                   font=("Helvetica", 16, "bold"),
+                                   bg=self.button_color, fg="white",
+                                   activebackground=self.red_color,
+                                   borderwidth=0, relief="flat", state='disabled')
         self.go_button.pack(side='left', padx=(10, 20))
 
-        self.progress = Progressbar(control_frame, style='Horizontal.TProgressbar', length=200, mode='determinate')
+        # Progress bar and activity indicator
+        # Configure the progress bar style with green color
+        style.configure('Green.Horizontal.TProgressbar', troughcolor=self.bg_color, background=self.button_color)
+        self.progress = ttk.Progressbar(control_frame, style='Green.Horizontal.TProgressbar', length=200,
+                                        mode='determinate')
         self.progress.pack(side='left', padx=(10, 20))
-
-        self.activity_indicator = Label(control_frame, text=" ", font=('Helvetica', 12))
+        self.activity_indicator = tk.Label(control_frame, text=" ", font=('Helvetica', 12), bg=self.bg_color)
         self.activity_indicator.pack(side='left', padx=(10, 0))
 
-        self.gif_label = Label(control_frame)  # Label to display the GIF
-        self.gif_label.pack(side='left', padx=(10, 0))
-        self.load_gif("busy.gif")
+        # GIF Frame with fixed size
+        gif_frame = tk.Frame(control_frame, width=250, height=250, bg=self.bg_color)
+        gif_frame.pack(side='left', padx=(10, 0))
+        gif_frame.pack_propagate(False)  # Prevent the frame from resizing
+        self.gif_label = tk.Label(gif_frame, bg=self.bg_color)
+        self.gif_label.pack(fill='both', expand=True)
+        self.gif_frames = []  # Initialize gif_frames to avoid AttributeError
 
-        self.preview_canvas = Canvas(preview_frame, bg='grey', width=595, height=842)  # A4 proportion (1:√2)
+        # Preview Canvas
+        self.preview_canvas = tk.Canvas(preview_frame, bg='grey', width=595, height=842)
         self.preview_canvas.pack(pady=20)
 
-        self.filename = None
-        self.output_pdf = None
-        self.preview_image = None
+    def show_about(self):
+        top = tk.Toplevel(self)
+        top.title("About PDF Mute")
 
+        message = "Version: 1.1\nCreated by Amit Hacoon"
+        msg_label = tk.Label(top, text=message)
+        msg_label.pack(pady=(10, 5))
+
+        # Link to GitHub
+        link_label = tk.Label(top, text="GitHub Repository", fg="blue", cursor="hand2")
+        link_label.pack()
+        link_label.bind("<Button-1>", lambda e: webbrowser.open_new("https://github.com/amithacoon/pdfmute"))
+
+        # Close button for the dialog
+        close_button = tk.Button(top, text="Close", command=top.destroy)
+        close_button.pack(pady=(5, 10))
 
     def load_gif(self, gif_path):
         self.gif_frames = []
@@ -183,7 +243,7 @@ class PDFRedRemoverApp(tk.Tk):
             frame = self.gif_frames[self.gif_index]
             self.gif_label.config(image=frame)
             self.gif_index = (self.gif_index + 1) % len(self.gif_frames)
-            self.after(50, self.animate_gif)  # Reduce delay to 50 milliseconds
+            self.after(50, self.animate_gif)
 
     def animate_activity(self):
         chars = ""
@@ -211,12 +271,14 @@ class PDFRedRemoverApp(tk.Tk):
             self.go_button.config(state='normal')  # Enable go button
 
     def process_pdf(self):
+        self.go_button.config(bg=self.red_color)
         self.running = True
         threading.Thread(target=self.animate_activity).start()
-        # Choose the processing function based on the selected algorithm
+        if not self.gif_frames:  # Ensure GIF has been loaded
+            self.load_gif('busy.gif')  # Provide the correct path
+        threading.Thread(target=self.animate_gif).start()
         process_func = self.process_thread_cpu if self.algorithm.get() == 'CPU' else self.process_thread_gpu
         threading.Thread(target=process_func, args=(self.filename, self.output_pdf)).start()
-        self.animate_gif()  # Start animating the GIF when processing starts
 
     def process_thread_cpu(self, input_pdf, output_pdf):
         try:
@@ -229,6 +291,8 @@ class PDFRedRemoverApp(tk.Tk):
             self.save_button.config(state='normal')
             self.go_button.config(state='normal')
             self.gif_label.config(image='')  # Hide GIF when done
+            self.go_button.config(bg=self.button_color)
+            self.activity_indicator.config(text="Done!")  # Update text to "Done!" when complete
 
     def process_thread_gpu(self, input_pdf, output_pdf):
         try:
@@ -241,7 +305,8 @@ class PDFRedRemoverApp(tk.Tk):
             self.save_button.config(state='normal')
             self.go_button.config(state='normal')
             self.gif_label.config(image='')  # Hide GIF when done
-
+            self.go_button.config(bg=self.button_color)
+            self.activity_indicator.config(text="Done!")  # Update text to "Done!" when complete
 
     def update_progress(self, progress):
         self.progress['value'] = progress
