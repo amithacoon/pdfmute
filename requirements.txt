@@ -1,2 +1,6 @@
 PyMuPDF==1.19.6
-Pillow==9.2.0
+Pillow~=10.1.0
+
+torch~=2.2.1
+fitz~=0.0.1.dev2
+numpy~=1.26.2
