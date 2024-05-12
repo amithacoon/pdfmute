@@ -1,16 +1,14 @@
+import fitz  # PyMuPDF
+import numpy as np
+import io
+import torch
+import webbrowser
 import tkinter as tk
-from tkinter import filedialog, messagebox, Canvas, Label, Button, Frame, StringVar, ttk
-from tkinter.ttk import Progressbar, Style
+from tkinter import ttk, filedialog
+from PIL import Image, ImageTk
 import threading
 import os
 import time
-import fitz  # PyMuPDF
-import numpy as np
-from PIL import Image, ImageTk
-import io  # For handling byte streams
-import torch
-import webbrowser
-
 def remove_red_pixels(input_pdf, output_pdf, progress_callback):
     doc = fitz.open(input_pdf)
     new_doc = fitz.Document()
@@ -114,18 +112,12 @@ def preview_pdf_page(pdf_path):
     doc.close()
     return img
 
-import tkinter as tk
-from tkinter import ttk, filedialog
-from PIL import Image, ImageTk
-import threading
-import os
-import time
 
 class PDFRedRemoverApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('PDF Mute')
-        self.geometry('1150x600')
+        self.geometry('1000x800')
 
         # Color Palette
         self.bg_color = "#f2f2f2"  # Light gray background
@@ -293,7 +285,7 @@ class PDFRedRemoverApp(tk.Tk):
             self.gif_label.config(image='')  # Hide GIF when done
             self.go_button.config(bg=self.button_color)
             self.activity_indicator.config(text="Done!")  # Update text to "Done!" when complete
-
+        pass
     def process_thread_gpu(self, input_pdf, output_pdf):
         try:
             remove_red_pixels_gpu(input_pdf, output_pdf, self.update_progress)
@@ -307,7 +299,7 @@ class PDFRedRemoverApp(tk.Tk):
             self.gif_label.config(image='')  # Hide GIF when done
             self.go_button.config(bg=self.button_color)
             self.activity_indicator.config(text="Done!")  # Update text to "Done!" when complete
-
+        pass
     def update_progress(self, progress):
         self.progress['value'] = progress
         self.update_idletasks()
@@ -315,3 +307,5 @@ class PDFRedRemoverApp(tk.Tk):
 if __name__ == '__main__':
     app = PDFRedRemoverApp()
     app.mainloop()
+
+
