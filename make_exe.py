@@ -1,14 +1,17 @@
 import fitz  # PyMuPDF
 import numpy as np
 import io
-import torch
+from torch import tensor, device
+from torch.cuda import is_available as cuda_is_available
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog
 from PIL import Image, ImageTk
 import threading
-import os
 import time
+import sys, os
+# os.chdir(sys._MEIPASS)
+
 def remove_red_pixels(input_pdf, output_pdf, progress_callback):
     doc = fitz.open(input_pdf)
     new_doc = fitz.Document()
@@ -73,18 +76,22 @@ def remove_red_pixels_gpu(input_pdf, output_pdf, progress_callback):
     # Open the PDF document
     doc = fitz.open(input_pdf)
     new_doc = fitz.Document()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    devicea = device("cuda" if cuda_is_available() else "cpu")
     total_pages = len(doc)
 
     for page_number, page in enumerate(doc):
         pix = page.get_pixmap(dpi=300)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        img_tensor = torch.tensor(np.array(img), device=device)
+        img_tensor = tensor(np.array(img), device=devicea)
         img_tensor = img_tensor.permute(2, 0, 1).float()  # Convert to C, H, W format
 
-        # Define a mask for red removal
+        # First pass: Remove strong red colors
         red_mask = (img_tensor[0] > 150) & (img_tensor[0] > img_tensor[1] * 1.2) & (img_tensor[0] > img_tensor[2] * 1.5)
-        img_tensor[:, red_mask] = torch.tensor([255.0, 255.0, 255.0], device=device).view(3, 1)
+        img_tensor[:, red_mask] = tensor([255.0, 255.0, 255.0], device=devicea).view(3, 1)
+
+        # Second pass: Remove lighter red (pink) colors
+        pink_mask = (img_tensor[0] > 140) & (img_tensor[0] > img_tensor[1] * 1.1) & (img_tensor[0] > img_tensor[2] * 1.2)
+        img_tensor[:, pink_mask] = tensor([255.0, 255.0, 255.0], device=devicea).view(3, 1)
 
         # Convert back to PIL Image to save in PDF
         img_tensor = img_tensor.byte().permute(1, 2, 0).cpu().numpy()
@@ -103,7 +110,6 @@ def remove_red_pixels_gpu(input_pdf, output_pdf, progress_callback):
     doc.close()
     new_doc.close()
 
-
 def preview_pdf_page(pdf_path):
     doc = fitz.open(pdf_path)
     page = doc.load_page(0)  # Load the first page
@@ -117,14 +123,21 @@ class PDFRedRemoverApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('PDF Mute')
-        self.geometry('1000x800')
+        self.geometry('1055x800')
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.threads = []
+        self.running = False
+        self.dot_count = 0  # To track the number of dots in the "Working" text
 
         # Color Palette
         self.bg_color = "#f2f2f2"  # Light gray background
         self.button_color = "#00a884"  # Teal for buttons
         self.button_hover_color = "#00876c"  # Darker teal on hover
         self.red_color = "#ff4d4d"  # Red for active state
+        # Setup Frames and Widgets
 
+        control_frame = tk.Frame(self, bg=self.bg_color)
+        control_frame.pack(fill='x', padx=20, pady=10)
         # Configure Style
         style = ttk.Style()
         style.theme_use("clam")
@@ -167,19 +180,22 @@ class PDFRedRemoverApp(tk.Tk):
 
         self.algorithm.set('CPU')  # Default selection
 
-        # Buttons
+
+
         self.load_button = tk.Button(control_frame, text='Load PDF', command=self.load_pdf)
         self.load_button.pack(side='left', padx=(10, 20))
+
         self.save_button = tk.Button(control_frame, text='Save as PDF', command=self.set_output, state='disabled')
         self.save_button.pack(side='left')
 
-        # Go Button with Color Change
         self.go_button = tk.Button(control_frame, text='Go', command=self.process_pdf,
-                                   font=("Helvetica", 16, "bold"),
-                                   bg=self.button_color, fg="white",
-                                   activebackground=self.red_color,
+                                   bg="#00a884", fg="white", activebackground="#ff4d4d",
                                    borderwidth=0, relief="flat", state='disabled')
         self.go_button.pack(side='left', padx=(10, 20))
+
+        # Set a fixed width for the button based on the text "Working..."
+        self.go_button.config(width=len("Working..."))
+
 
         # Progress bar and activity indicator
         # Configure the progress bar style with green color
@@ -202,6 +218,21 @@ class PDFRedRemoverApp(tk.Tk):
         self.preview_canvas = tk.Canvas(preview_frame, bg='grey', width=595, height=842)
         self.preview_canvas.pack(pady=20)
 
+    def update_button_text(self):
+        while self.running:
+            self.dot_count = (self.dot_count % 3) + 1
+            text = "Working" + "." * self.dot_count
+            # No need to reconfigure the button size here as it's already fixed
+            self.go_button.config(text=text)
+            time.sleep(0.5)  # Adjust the speed of text update here
+    def on_closing(self):
+        self.running = False
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.join()
+        self.destroy()
+
+
     def show_about(self):
         top = tk.Toplevel(self)
         top.title("About PDF Mute")
@@ -222,20 +253,25 @@ class PDFRedRemoverApp(tk.Tk):
     def load_gif(self, gif_path):
         self.gif_frames = []
         self.gif_index = 0
-        self.gif = Image.open(gif_path)
         try:
+            self.gif = Image.open(gif_path)
             while True:
                 self.gif_frames.append(ImageTk.PhotoImage(self.gif.copy()))
                 self.gif.seek(self.gif.tell() + 1)
         except EOFError:
             pass  # End of GIF file
+        except Exception as e:
+            print(f"Failed to load GIF: {e}")  # Add error logging or handling as needed
 
     def animate_gif(self):
         if self.running:
             frame = self.gif_frames[self.gif_index]
             self.gif_label.config(image=frame)
             self.gif_index = (self.gif_index + 1) % len(self.gif_frames)
+            # Using self.after to schedule the next frame, which is UI thread friendly
             self.after(50, self.animate_gif)
+        else:
+            self.gif_label.config(image=None)  # Optionally clear the GIF
 
     def animate_activity(self):
         chars = ""
@@ -263,14 +299,25 @@ class PDFRedRemoverApp(tk.Tk):
             self.go_button.config(state='normal')  # Enable go button
 
     def process_pdf(self):
-        self.go_button.config(bg=self.red_color)
+        self.go_button.config(bg=self.red_color, text="Working")
         self.running = True
-        threading.Thread(target=self.animate_activity).start()
-        if not self.gif_frames:  # Ensure GIF has been loaded
-            self.load_gif('busy.gif')  # Provide the correct path
-        threading.Thread(target=self.animate_gif).start()
+
+        # Load the GIF file and start animating it
+        self.load_gif('busy.gif')  # Ensure the correct path
+        self.animate_gif()
+
+        # Start the thread that updates the button text
+        text_update_thread = threading.Thread(target=self.update_button_text, daemon=True)
+        text_update_thread.start()
+
+        # Determine the processing function based on the chosen algorithm (CPU or GPU)
         process_func = self.process_thread_cpu if self.algorithm.get() == 'CPU' else self.process_thread_gpu
-        threading.Thread(target=process_func, args=(self.filename, self.output_pdf)).start()
+
+        # Start the processing thread with normal priority if possible
+        processing_thread = threading.Thread(target=process_func, args=(self.filename, self.output_pdf))
+        processing_thread.setDaemon(True)
+        processing_thread.start()
+        self.threads.append(processing_thread)
 
     def process_thread_cpu(self, input_pdf, output_pdf):
         try:
@@ -285,6 +332,9 @@ class PDFRedRemoverApp(tk.Tk):
             self.gif_label.config(image='')  # Hide GIF when done
             self.go_button.config(bg=self.button_color)
             self.activity_indicator.config(text="Done!")  # Update text to "Done!" when complete
+            self.progress['value'] = 0  # Reset the progress bar to 0
+            self.cleanup_after_thread()
+
         pass
     def process_thread_gpu(self, input_pdf, output_pdf):
         try:
@@ -299,7 +349,15 @@ class PDFRedRemoverApp(tk.Tk):
             self.gif_label.config(image='')  # Hide GIF when done
             self.go_button.config(bg=self.button_color)
             self.activity_indicator.config(text="Done!")  # Update text to "Done!" when complete
+            self.progress['value'] = 0  # Reset the progress bar to 0
+            self.cleanup_after_thread()
+
         pass
+
+    def cleanup_after_thread(self):
+        self.running = False
+        self.go_button.config(bg=self.button_color, text="Go", state='normal')  # Reset button text to "Go"
+        # Any additional cleanup code
     def update_progress(self, progress):
         self.progress['value'] = progress
         self.update_idletasks()
