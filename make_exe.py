@@ -10,7 +10,7 @@ from PIL import Image, ImageTk
 import threading
 import time
 import sys, os
-# os.chdir(sys._MEIPASS)
+os.chdir(sys._MEIPASS)
 
 def remove_red_pixels(input_pdf, output_pdf, progress_callback):
     doc = fitz.open(input_pdf)
@@ -130,7 +130,10 @@ class PDFRedRemoverApp(tk.Tk):
         self.dot_count = 0  # To track the number of dots in the "Working" text
 
         # Color Palette
-        self.bg_color = "#f2f2f2"  # Light gray background
+        self.bg_color = "#ffffff"  # White background
+        self.primary_color = "#007bff"  # Blue for primary buttons
+        self.secondary_color = "#6c757d"  # Grey for secondary elements
+        self.highlight_color = "#28a745"  # Green for highlights
         self.button_color = "#00a884"  # Teal for buttons
         self.button_hover_color = "#00876c"  # Darker teal on hover
         self.red_color = "#ff4d4d"  # Red for active state
@@ -142,23 +145,29 @@ class PDFRedRemoverApp(tk.Tk):
         style = ttk.Style()
         style.theme_use("clam")
 
-        # Customize Button Style
-        style.configure("TButton", font=("Helvetica", 14), padding=10,
-                        background=self.button_color, foreground="white",
-                        borderradius=5)
+        style.configure("TButton", font=("Helvetica", 12), padding=10,
+                        background=self.primary_color, foreground="white",
+                        borderwidth=0, relief="flat")
+        style.map("TButton", background=[('active', self.highlight_color)])
 
-        # Configure Label Style
-        style.configure("TLabel", font=("Helvetica", 12))
+        style.configure("TLabel", font=("Helvetica", 12), background=self.bg_color)
+        style.configure("Green.Horizontal.TProgressbar", troughcolor=self.bg_color,
+                        background=self.highlight_color)
 
         # Main Frames
-        control_frame = tk.Frame(self, bg=self.bg_color)
-        control_frame.pack(fill='x', padx=20, pady=10)
+        main_frame = tk.Frame(self, bg=self.bg_color)
+        main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+
         preview_frame = tk.Frame(self, bg=self.bg_color)
         preview_frame.pack(fill='both', expand=True, padx=20, pady=10)
 
-        # Algorithm selection frame
-        algorithm_frame = tk.Frame(control_frame, bg=self.bg_color)
-        algorithm_frame.pack(side='left', padx=10)
+        control_frame = tk.Frame(main_frame, bg=self.bg_color)
+        control_frame.pack(fill='x')
+
+        # Algorithm selection area
+        algorithm_frame = tk.LabelFrame(control_frame, text="Pick an Algorithm:", font=("Helvetica", 14),
+                                        bg=self.bg_color, fg=self.secondary_color)
+        algorithm_frame.pack(side='left', padx=10, pady=11, fill='y')
 
         selection_label = tk.Label(algorithm_frame, text="Pick an Algorithm:", background=self.bg_color, font=("Helvetica", 12))
         selection_label.pack(side='top', padx=10, pady=(0, 10))  # Add some padding to separate from the radio buttons
@@ -182,15 +191,25 @@ class PDFRedRemoverApp(tk.Tk):
 
 
 
-        self.load_button = tk.Button(control_frame, text='Load PDF', command=self.load_pdf)
-        self.load_button.pack(side='left', padx=(10, 20))
+        # Button Panel
+        button_panel = tk.Frame(control_frame, bg=self.bg_color)
+        button_panel.pack(side='left', padx=20, fill='y')
 
-        self.save_button = tk.Button(control_frame, text='Save as PDF', command=self.set_output, state='disabled')
-        self.save_button.pack(side='left')
+        self.load_button = tk.Button(button_panel, text='Load PDF', command=self.load_pdf)
+        self.save_button = tk.Button(button_panel, text='Save as PDF', command=self.set_output, state='disabled')
+
+        self.load_button.pack(side='top', pady=10, fill='x')
+        self.save_button.pack(side='top', pady=10, fill='x')
 
         self.go_button = tk.Button(control_frame, text='Go', command=self.process_pdf,
                                    bg="#00a884", fg="white", activebackground="#ff4d4d",
                                    borderwidth=0, relief="flat", state='disabled')
+
+        # Calculate padding to make the button circular
+        button_size = 40  # Adjust this value to control the button size
+        padding = (button_size - self.go_button.winfo_reqwidth()) // 2
+
+        self.go_button.config(padx=padding, pady=padding)
         self.go_button.pack(side='left', padx=(10, 20))
 
         # Set a fixed width for the button based on the text "Working..."
@@ -203,8 +222,9 @@ class PDFRedRemoverApp(tk.Tk):
         self.progress = ttk.Progressbar(control_frame, style='Green.Horizontal.TProgressbar', length=200,
                                         mode='determinate')
         self.progress.pack(side='left', padx=(10, 20))
-        self.activity_indicator = tk.Label(control_frame, text=" ", font=('Helvetica', 12), bg=self.bg_color)
-        self.activity_indicator.pack(side='left', padx=(10, 0))
+        # Activity indicator
+        self.activity_indicator = tk.Label(control_frame, text="Ready", font=('Helvetica', 12), bg=self.bg_color)
+        self.activity_indicator.pack(side='left', padx=10)
 
         # GIF Frame with fixed size
         gif_frame = tk.Frame(control_frame, width=250, height=250, bg=self.bg_color)
@@ -213,10 +233,9 @@ class PDFRedRemoverApp(tk.Tk):
         self.gif_label = tk.Label(gif_frame, bg=self.bg_color)
         self.gif_label.pack(fill='both', expand=True)
         self.gif_frames = []  # Initialize gif_frames to avoid AttributeError
-
         # Preview Canvas
         self.preview_canvas = tk.Canvas(preview_frame, bg='grey', width=595, height=842)
-        self.preview_canvas.pack(pady=20)
+        self.preview_canvas.pack(pady=10)
 
     def update_button_text(self):
         while self.running:
