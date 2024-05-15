@@ -10,11 +10,16 @@ from PIL import Image, ImageTk
 import threading
 import time
 import sys, os
-os.chdir(sys._MEIPASS)
+# os.chdir(sys._MEIPASS)
 
-def remove_red_pixels(input_pdf, output_pdf, progress_callback):
+
+def remove_red_pixels(input_pdf, output_pdf, progress_callback, color):
     doc = fitz.open(input_pdf)
     new_doc = fitz.Document()
+    if color == 'white':
+        colorrgb = (255, 255, 255)
+    if color == 'black':
+        colorrgb = (0, 0, 0)
 
     target_colors = [
         ((224, 202, 202), 5),
@@ -46,19 +51,23 @@ def remove_red_pixels(input_pdf, output_pdf, progress_callback):
             for x in range(img.width):
                 r, g, b = pixels[x, y]
                 if r > 150 and r > g * 1.2 and r > b * 1.5 and (r + g + b) > 100:
-                    pixels[x, y] = (255, 255, 255)
+
+                    pixels[x, y] = colorrgb
                 else:
                     for color, delta in target_colors:
                         if abs(r - color[0]) <= delta and abs(g - color[1]) <= delta and abs(b - color[2]) <= delta:
-                            pixels[x, y] = (255, 255, 255)
+                            pixels[x, y] = colorrgb
                             break
 
         # Second pass - convert remaining reddish pixels (adjust thresholds as needed)
-        for y in range(img.height):
-            for x in range(img.width):
-                r, g, b = pixels[x, y]
-                if r > g and r > b and r > 180:  # Adjust threshold for reddishness
-                    pixels[x, y] = (255, 255, 255)
+        if color == 'white':
+            for y in range(img.height):
+                for x in range(img.width):
+                    r, g, b = pixels[x, y]
+                    if r > g and r > b and r > 180:  # Adjust threshold for reddishness
+                        pixels[x, y] = (255, 255, 255)
+        else:
+            pass
 
         img_byte_arr = io.BytesIO()
         img.save(img_byte_arr, format='JPEG', quality=100)
@@ -72,8 +81,12 @@ def remove_red_pixels(input_pdf, output_pdf, progress_callback):
     doc.close()
     new_doc.close()
 
-def remove_red_pixels_gpu(input_pdf, output_pdf, progress_callback):
+def remove_red_pixels_gpu(input_pdf, output_pdf, progress_callback, color):
     # Open the PDF document
+    if color == 'white':
+        colorrgb = (255.0, 255.0, 255.0)
+    if color == 'black':
+        colorrgb = (0.0, 0.0, 0.0)
     doc = fitz.open(input_pdf)
     new_doc = fitz.Document()
     devicea = device("cuda" if cuda_is_available() else "cpu")
@@ -87,11 +100,11 @@ def remove_red_pixels_gpu(input_pdf, output_pdf, progress_callback):
 
         # First pass: Remove strong red colors
         red_mask = (img_tensor[0] > 150) & (img_tensor[0] > img_tensor[1] * 1.2) & (img_tensor[0] > img_tensor[2] * 1.5)
-        img_tensor[:, red_mask] = tensor([255.0, 255.0, 255.0], device=devicea).view(3, 1)
+        img_tensor[:, red_mask] = tensor(colorrgb, device=devicea).view(3, 1)
 
         # Second pass: Remove lighter red (pink) colors
         pink_mask = (img_tensor[0] > 140) & (img_tensor[0] > img_tensor[1] * 1.1) & (img_tensor[0] > img_tensor[2] * 1.2)
-        img_tensor[:, pink_mask] = tensor([255.0, 255.0, 255.0], device=devicea).view(3, 1)
+        img_tensor[:, pink_mask] = tensor(colorrgb, device=devicea).view(3, 1)
 
         # Convert back to PIL Image to save in PDF
         img_tensor = img_tensor.byte().permute(1, 2, 0).cpu().numpy()
@@ -119,11 +132,15 @@ def preview_pdf_page(pdf_path):
     return img
 
 
+selected_color = "white"
+
+
 class PDFRedRemoverApp(tk.Tk):
     def __init__(self):
         super().__init__()
+
         self.title('PDF Mute')
-        self.geometry('1055x800')
+        self.geometry('1155x800')
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.threads = []
         self.running = False
@@ -137,19 +154,18 @@ class PDFRedRemoverApp(tk.Tk):
         self.button_color = "#00a884"  # Teal for buttons
         self.button_hover_color = "#00876c"  # Darker teal on hover
         self.red_color = "#ff4d4d"  # Red for active state
-        # Setup Frames and Widgets
 
+        # Setup Frames and Widgets
         control_frame = tk.Frame(self, bg=self.bg_color)
         control_frame.pack(fill='x', padx=20, pady=10)
+
         # Configure Style
         style = ttk.Style()
         style.theme_use("clam")
-
         style.configure("TButton", font=("Helvetica", 12), padding=10,
                         background=self.primary_color, foreground="white",
                         borderwidth=0, relief="flat")
         style.map("TButton", background=[('active', self.highlight_color)])
-
         style.configure("TLabel", font=("Helvetica", 12), background=self.bg_color)
         style.configure("Green.Horizontal.TProgressbar", troughcolor=self.bg_color,
                         background=self.highlight_color)
@@ -157,10 +173,8 @@ class PDFRedRemoverApp(tk.Tk):
         # Main Frames
         main_frame = tk.Frame(self, bg=self.bg_color)
         main_frame.pack(fill='both', expand=True, padx=20, pady=20)
-
         preview_frame = tk.Frame(self, bg=self.bg_color)
         preview_frame.pack(fill='both', expand=True, padx=20, pady=10)
-
         control_frame = tk.Frame(main_frame, bg=self.bg_color)
         control_frame.pack(fill='x')
 
@@ -169,7 +183,8 @@ class PDFRedRemoverApp(tk.Tk):
                                         bg=self.bg_color, fg=self.secondary_color)
         algorithm_frame.pack(side='left', padx=10, pady=11, fill='y')
 
-        selection_label = tk.Label(algorithm_frame, text="Pick an Algorithm:", background=self.bg_color, font=("Helvetica", 12))
+        selection_label = tk.Label(algorithm_frame, text="Pick an Algorithm:", background=self.bg_color,
+                                   font=("Helvetica", 12))
         selection_label.pack(side='top', padx=10, pady=(0, 10))  # Add some padding to separate from the radio buttons
 
         # Algorithm selection radio buttons with labels
@@ -178,18 +193,31 @@ class PDFRedRemoverApp(tk.Tk):
         cpu_label = ttk.Label(algorithm_frame, text='- Slow and High quality result', background=self.bg_color)
         gpu_button = ttk.Radiobutton(algorithm_frame, text='GPU', value='GPU', variable=self.algorithm)
         gpu_label = ttk.Label(algorithm_frame, text='- Fast and Low quality result', background=self.bg_color)
-        about_button = tk.Button(algorithm_frame, text='About', command=self.show_about, font=('Helvetica', 12, 'bold'), bg=self.bg_color)
-
+        about_button = tk.Button(algorithm_frame, text='About', command=self.show_about, font=('Helvetica', 12, 'bold'),
+                                 bg=self.bg_color)
 
         cpu_button.pack(anchor='w')
         cpu_label.pack(anchor='w')
         gpu_button.pack(anchor='w')
         gpu_label.pack(anchor='w')
         about_button.pack(side='top', pady=(10, 0))  # Positioned at the top of the frame, under the radio buttons
-
         self.algorithm.set('CPU')  # Default selection
 
+        # Add "Turn red to:" section
+        color_frame = tk.LabelFrame(control_frame, text="Turn red to:", font=("Helvetica", 14),
+                                    bg=self.bg_color, fg=self.secondary_color)
+        color_frame.pack(side='left', padx=10, pady=11, fill='y')
 
+        self.color_choice = tk.StringVar()
+        self.color_choice.set("white")  # Default color choice
+
+        white_button = ttk.Radiobutton(color_frame, text='White', value='white', variable=self.color_choice,
+                                       command=self.update_color)
+        black_button = ttk.Radiobutton(color_frame, text='Black', value='black', variable=self.color_choice,
+                                       command=self.update_color)
+
+        white_button.pack(anchor='w', padx=10, pady=5)
+        black_button.pack(anchor='w', padx=10, pady=5)
 
         # Button Panel
         button_panel = tk.Frame(control_frame, bg=self.bg_color)
@@ -215,7 +243,6 @@ class PDFRedRemoverApp(tk.Tk):
         # Set a fixed width for the button based on the text "Working..."
         self.go_button.config(width=len("Working..."))
 
-
         # Progress bar and activity indicator
         # Configure the progress bar style with green color
         style.configure('Green.Horizontal.TProgressbar', troughcolor=self.bg_color, background=self.button_color)
@@ -236,6 +263,11 @@ class PDFRedRemoverApp(tk.Tk):
         # Preview Canvas
         self.preview_canvas = tk.Canvas(preview_frame, bg='grey', width=595, height=842)
         self.preview_canvas.pack(pady=10)
+
+
+    def update_color(self):
+        global selected_color
+        selected_color = "white" if self.color_choice.get() == "white" else "black"
 
     def update_button_text(self):
         while self.running:
@@ -333,14 +365,14 @@ class PDFRedRemoverApp(tk.Tk):
         process_func = self.process_thread_cpu if self.algorithm.get() == 'CPU' else self.process_thread_gpu
 
         # Start the processing thread with normal priority if possible
-        processing_thread = threading.Thread(target=process_func, args=(self.filename, self.output_pdf))
+        processing_thread = threading.Thread(target=process_func, args=(self.filename, self.output_pdf, selected_color))
         processing_thread.setDaemon(True)
         processing_thread.start()
         self.threads.append(processing_thread)
 
-    def process_thread_cpu(self, input_pdf, output_pdf):
+    def process_thread_cpu(self, input_pdf, output_pdf, selected_color):
         try:
-            remove_red_pixels(input_pdf, output_pdf, self.update_progress)
+            remove_red_pixels(input_pdf, output_pdf, self.update_progress, selected_color)
             self.activity_indicator.config(text="Done!")  # Update text to Done when complete
         except Exception as e:
             self.activity_indicator.config(text="Error!")  # Show error in the activity indicator
@@ -355,9 +387,9 @@ class PDFRedRemoverApp(tk.Tk):
             self.cleanup_after_thread()
 
         pass
-    def process_thread_gpu(self, input_pdf, output_pdf):
+    def process_thread_gpu(self, input_pdf, output_pdf, selected_color):
         try:
-            remove_red_pixels_gpu(input_pdf, output_pdf, self.update_progress)
+            remove_red_pixels_gpu(input_pdf, output_pdf, self.update_progress,selected_color)
             self.activity_indicator.config(text="Done!")  # Update text to Done when complete
         except Exception as e:
             self.activity_indicator.config(text="Error!")  # Show error in the activity indicator
