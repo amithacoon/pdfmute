@@ -1,26 +1,60 @@
+"""
+PDFMute - Version 2
+
+Changes from v1 to v2:
+1. Professional Layout and UI:
+   - We now use a two-column layout:
+     a. Left panel for user controls (Algorithm, Color Choice, 'About' Button).
+     b. Right panel for PDF/Docx loading, progress bar, and preview.
+   - Center panel for the "Go" button and animated GIF.
+   - Overall styling uses custom ttk styles and a consistent color theme.
+
+2. Improved Code Organization:
+   - Clear separation of responsibilities:
+     - "GUI Setup" code is grouped together.
+     - "Logic / Worker" functions remain external.
+     - "Conversion + Red Removal" flows are integrated in a simpler manner.
+
+3. Enhanced Feedback:
+   - Status label shows "Ready", "Working...", "Done", or "Error" states more clearly.
+   - The animated GIF is displayed near the progress bar for better visibility.
+
+4. Additional Minor Tweaks:
+   - More robust docx2pdf usage (try/except).
+   - On finishing tasks, UI resets properly.
+   - Code refactoring and improved naming.
+"""
+
+import io
+import os
+import sys
+import time
+import threading
+import webbrowser
+
 import fitz  # PyMuPDF
 import numpy as np
-import io
+from docx2pdf import convert as docx2pdf_convert
+from PIL import Image, ImageTk
+from tkinter import Tk, Frame, Canvas, Label, Button, Toplevel, filedialog, StringVar
+from tkinter import ttk
+
+# Torch is only used in the remove_red_pixels_gpu function
 from torch import tensor, device
 from torch.cuda import is_available as cuda_is_available
-import webbrowser
-import tkinter as tk
-from tkinter import ttk, filedialog
-from PIL import Image, ImageTk
-import threading
-import time
-import sys, os
-# os.chdir(sys._MEIPASS)
 
 
+# ------------- RED REMOVAL LOGIC (CPU) ------------- #
 def remove_red_pixels(input_pdf, output_pdf, progress_callback, color):
+    """
+    Remove red (or pink) pixels from a PDF by converting them to white/black.
+    Uses CPU-based approach with PyMuPDF + PIL.
+    """
     doc = fitz.open(input_pdf)
     new_doc = fitz.Document()
-    if color == 'white':
-        colorrgb = (255, 255, 255)
-    if color == 'black':
-        colorrgb = (0, 0, 0)
+    colorrgb = (255, 255, 255) if color == 'white' else (0, 0, 0)
 
+    # Pre-defined target colors (e.g. pink-ish or near red) with delta tolerance
     target_colors = [
         ((224, 202, 202), 5),
         ((218, 203, 204), 5),
@@ -46,375 +80,500 @@ def remove_red_pixels(input_pdf, output_pdf, progress_callback, color):
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         pixels = img.load()
 
-        # First pass - convert intense red pixels and target colors
+        # Pass 1: Intense red + target colors
         for y in range(img.height):
             for x in range(img.width):
                 r, g, b = pixels[x, y]
-                if r > 150 and r > g * 1.2 and r > b * 1.5 and (r + g + b) > 100:
 
+                # Condition for intense red
+                if r > 150 and r > g * 1.2 and r > b * 1.5 and (r + g + b) > 100:
                     pixels[x, y] = colorrgb
                 else:
-                    for color, delta in target_colors:
-                        if abs(r - color[0]) <= delta and abs(g - color[1]) <= delta and abs(b - color[2]) <= delta:
+                    for ccheck, delta in target_colors:
+                        if abs(r - ccheck[0]) <= delta and \
+                           abs(g - ccheck[1]) <= delta and \
+                           abs(b - ccheck[2]) <= delta:
                             pixels[x, y] = colorrgb
                             break
 
-        # Second pass - convert remaining reddish pixels (adjust thresholds as needed)
+        # Pass 2: Additional pass for leftover reds if color is white
         if color == 'white':
             for y in range(img.height):
                 for x in range(img.width):
                     r, g, b = pixels[x, y]
-                    if r > g and r > b and r > 180:  # Adjust threshold for reddishness
+                    if r > g and r > b and r > 180:
                         pixels[x, y] = (255, 255, 255)
-        else:
-            pass
 
+        # Save to PDF
         img_byte_arr = io.BytesIO()
         img.save(img_byte_arr, format='JPEG', quality=100)
         img_byte_arr.seek(0)
         new_page = new_doc.new_page(width=pix.width, height=pix.height)
         new_page.insert_image(new_page.rect, stream=img_byte_arr.read())
-        progress_percent = ((page_number + 1) / total_pages) * 100
-        progress_callback(progress_percent)  # Update the progress
 
+        # Update progress
+        progress_callback(((page_number + 1) / total_pages) * 100)
+
+    # Save the processed PDF
     new_doc.save(output_pdf)
     doc.close()
     new_doc.close()
 
+
+# ------------- RED REMOVAL LOGIC (GPU) ------------- #
 def remove_red_pixels_gpu(input_pdf, output_pdf, progress_callback, color):
-    # Open the PDF document
-    if color == 'white':
-        colorrgb = (255.0, 255.0, 255.0)
-    if color == 'black':
-        colorrgb = (0.0, 0.0, 0.0)
+    """
+    Remove red (or pink) pixels from a PDF by converting them to white/black.
+    Uses GPU-based approach via PyTorch Tensors.
+    """
     doc = fitz.open(input_pdf)
     new_doc = fitz.Document()
-    devicea = device("cuda" if cuda_is_available() else "cpu")
-    total_pages = len(doc)
+    device_gpu = device("cuda" if cuda_is_available() else "cpu")
+    colorrgb = (255.0, 255.0, 255.0) if color == 'white' else (0.0, 0.0, 0.0)
 
+    total_pages = len(doc)
     for page_number, page in enumerate(doc):
         pix = page.get_pixmap(dpi=300)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        img_tensor = tensor(np.array(img), device=devicea)
-        img_tensor = img_tensor.permute(2, 0, 1).float()  # Convert to C, H, W format
 
-        # First pass: Remove strong red colors
+        # Convert to tensor on GPU/CPU
+        img_tensor = tensor(np.array(img), device=device_gpu).permute(2, 0, 1).float()
+
+        # Pass 1: Strong red
         red_mask = (img_tensor[0] > 150) & (img_tensor[0] > img_tensor[1] * 1.2) & (img_tensor[0] > img_tensor[2] * 1.5)
-        img_tensor[:, red_mask] = tensor(colorrgb, device=devicea).view(3, 1)
+        img_tensor[:, red_mask] = tensor(colorrgb, device=device_gpu).view(3, 1)
 
-        # Second pass: Remove lighter red (pink) colors
+        # Pass 2: Lighter pinkish
         pink_mask = (img_tensor[0] > 140) & (img_tensor[0] > img_tensor[1] * 1.1) & (img_tensor[0] > img_tensor[2] * 1.2)
-        img_tensor[:, pink_mask] = tensor(colorrgb, device=devicea).view(3, 1)
+        img_tensor[:, pink_mask] = tensor(colorrgb, device=device_gpu).view(3, 1)
 
-        # Convert back to PIL Image to save in PDF
-        img_tensor = img_tensor.byte().permute(1, 2, 0).cpu().numpy()
-        img = Image.fromarray(img_tensor)
+        # Convert back to PIL
+        final_img = Image.fromarray(img_tensor.byte().permute(1, 2, 0).cpu().numpy())
         img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format='JPEG', quality=100)
+        final_img.save(img_byte_arr, format='JPEG', quality=100)
         img_byte_arr.seek(0)
 
+        # Insert into new PDF
         new_page = new_doc.new_page(width=pix.width, height=pix.height)
         new_page.insert_image(new_page.rect, stream=img_byte_arr.read())
 
-        progress_percent = ((page_number + 1) / total_pages) * 100
-        progress_callback(progress_percent)  # Update the progress
+        # Update progress
+        progress_callback(((page_number + 1) / total_pages) * 100)
 
     new_doc.save(output_pdf)
     doc.close()
     new_doc.close()
 
+
+# ------------- DOCX / DOC -> PDF CONVERSION ------------- #
+def convert_docx_to_pdf(input_file, output_file):
+    """
+    Convert DOC or DOCX to PDF using docx2pdf.
+    Requires Microsoft Word on Windows or fallback solution on other OS.
+    """
+    docx2pdf_convert(input_file, output_file)
+
+
+# ------------- PDF PREVIEW ------------- #
 def preview_pdf_page(pdf_path):
+    """
+    Returns a PIL.Image of the first page of the PDF (at a reduced DPI).
+    """
     doc = fitz.open(pdf_path)
-    page = doc.load_page(0)  # Load the first page
-    pix = page.get_pixmap(dpi=100)  # Render page to an image
+    page = doc.load_page(0)
+    pix = page.get_pixmap(dpi=100)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     doc.close()
     return img
 
 
-selected_color = "white"
-
-
-class PDFRedRemoverApp(tk.Tk):
+# ------------- MAIN APPLICATION CLASS ------------- #
+class PDFMuteApp(Tk):
     def __init__(self):
         super().__init__()
+        self.title("PDFMute v2 - Professional Edition")
+        self.geometry("1250x850")
+        self.minsize(1000, 700)
 
-        self.title('PDF Mute')
-        self.geometry('1155x800')
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        # State tracking
+        self.input_file = None
+        self.output_file = None
+        self.running = False
+        self.dot_count = 0
         self.threads = []
-        self.running = False
-        self.dot_count = 0  # To track the number of dots in the "Working" text
 
-        # Color Palette
-        self.bg_color = "#ffffff"  # White background
-        self.primary_color = "#007bff"  # Blue for primary buttons
-        self.secondary_color = "#6c757d"  # Grey for secondary elements
-        self.highlight_color = "#28a745"  # Green for highlights
-        self.button_color = "#00a884"  # Teal for buttons
-        self.button_hover_color = "#00876c"  # Darker teal on hover
-        self.red_color = "#ff4d4d"  # Red for active state
+        # Default selection
+        self.algorithm_choice = StringVar(value="CPU")
+        self.color_choice = StringVar(value="white")
 
-        # Setup Frames and Widgets
-        control_frame = tk.Frame(self, bg=self.bg_color)
-        control_frame.pack(fill='x', padx=20, pady=10)
+        # Color palette
+        self.bg_color = "#EFEFEF"         # Light gray background
+        self.primary_color = "#006666"    # Primary teal
+        self.accent_color = "#009999"     # Lighter teal accent
+        self.highlight_color = "#00CC99"  # Highlight color (greenish-teal)
+        self.font_color = "#333333"       # Dark text
+        self.red_color = "#FF4D4D"
 
-        # Configure Style
-        style = ttk.Style()
+        # Configure the style
+        self._configure_styles()
+
+        # Build main layout
+        self._build_layout()
+
+    # ------------------- STYLES ------------------- #
+    def _configure_styles(self):
+        """
+        Configure ttk styles for a professional look.
+        """
+        style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("TButton", font=("Helvetica", 12), padding=10,
-                        background=self.primary_color, foreground="white",
-                        borderwidth=0, relief="flat")
-        style.map("TButton", background=[('active', self.highlight_color)])
-        style.configure("TLabel", font=("Helvetica", 12), background=self.bg_color)
-        style.configure("Green.Horizontal.TProgressbar", troughcolor=self.bg_color,
-                        background=self.highlight_color)
 
-        # Main Frames
-        main_frame = tk.Frame(self, bg=self.bg_color)
-        main_frame.pack(fill='both', expand=True, padx=20, pady=20)
-        preview_frame = tk.Frame(self, bg=self.bg_color)
-        preview_frame.pack(fill='both', expand=True, padx=20, pady=10)
-        control_frame = tk.Frame(main_frame, bg=self.bg_color)
-        control_frame.pack(fill='x')
+        # General label
+        style.configure("TLabel", background=self.bg_color, foreground=self.font_color, font=("Helvetica", 12))
 
-        # Algorithm selection area
-        algorithm_frame = tk.LabelFrame(control_frame, text="Pick an Algorithm:", font=("Helvetica", 14),
-                                        bg=self.bg_color, fg=self.secondary_color)
-        algorithm_frame.pack(side='left', padx=10, pady=11, fill='y')
+        # Frame
+        style.configure("TFrame", background=self.bg_color)
 
-        selection_label = tk.Label(algorithm_frame, text="Pick an Algorithm:", background=self.bg_color,
-                                   font=("Helvetica", 12))
-        selection_label.pack(side='top', padx=10, pady=(0, 10))  # Add some padding to separate from the radio buttons
+        # Button
+        style.configure("TButton",
+                        background=self.primary_color,
+                        foreground="#FFFFFF",
+                        font=("Helvetica", 12, "bold"),
+                        borderwidth=0,
+                        padding=5)
 
-        # Algorithm selection radio buttons with labels
-        self.algorithm = tk.StringVar()
-        cpu_button = ttk.Radiobutton(algorithm_frame, text='CPU', value='CPU', variable=self.algorithm)
-        cpu_label = ttk.Label(algorithm_frame, text='- Slow and High quality result', background=self.bg_color)
-        gpu_button = ttk.Radiobutton(algorithm_frame, text='GPU', value='GPU', variable=self.algorithm)
-        gpu_label = ttk.Label(algorithm_frame, text='- Fast and Low quality result', background=self.bg_color)
-        about_button = tk.Button(algorithm_frame, text='About', command=self.show_about, font=('Helvetica', 12, 'bold'),
-                                 bg=self.bg_color)
+        style.map("TButton",
+                  background=[("active", self.highlight_color),
+                              ("disabled", "#A0A0A0")])
 
-        cpu_button.pack(anchor='w')
-        cpu_label.pack(anchor='w')
-        gpu_button.pack(anchor='w')
-        gpu_label.pack(anchor='w')
-        about_button.pack(side='top', pady=(10, 0))  # Positioned at the top of the frame, under the radio buttons
-        self.algorithm.set('CPU')  # Default selection
+        # Progress bar
+        style.configure("Green.Horizontal.TProgressbar",
+                        troughcolor="#FFFFFF",
+                        background=self.highlight_color,
+                        bordercolor=self.bg_color,
+                        lightcolor=self.highlight_color,
+                        darkcolor=self.highlight_color)
 
-        # Add "Turn red to:" section
-        color_frame = tk.LabelFrame(control_frame, text="Turn red to:", font=("Helvetica", 14),
-                                    bg=self.bg_color, fg=self.secondary_color)
-        color_frame.pack(side='left', padx=10, pady=11, fill='y')
+    # ------------------- LAYOUT ------------------- #
+    def _build_layout(self):
+        """
+        Build the main layout:
+        Left column for controls, center for 'Go' & GIF, right for preview & status.
+        """
+        self.configure(bg=self.bg_color)
 
-        self.color_choice = tk.StringVar()
-        self.color_choice.set("white")  # Default color choice
+        # Main container frames
+        container = ttk.Frame(self, style="TFrame")
+        container.pack(fill="both", expand=True, padx=10, pady=10)
 
-        white_button = ttk.Radiobutton(color_frame, text='White', value='white', variable=self.color_choice,
-                                       command=self.update_color)
-        black_button = ttk.Radiobutton(color_frame, text='Black', value='black', variable=self.color_choice,
-                                       command=self.update_color)
+        left_frame = ttk.Frame(container, style="TFrame")
+        left_frame.pack(side="left", fill="y", padx=(0, 10))
 
-        white_button.pack(anchor='w', padx=10, pady=5)
-        black_button.pack(anchor='w', padx=10, pady=5)
+        center_frame = ttk.Frame(container, style="TFrame")
+        center_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
 
-        # Button Panel
-        button_panel = tk.Frame(control_frame, bg=self.bg_color)
-        button_panel.pack(side='left', padx=20, fill='y')
+        right_frame = ttk.Frame(container, style="TFrame")
+        right_frame.pack(side="right", fill="y")
 
-        self.load_button = tk.Button(button_panel, text='Load PDF', command=self.load_pdf)
-        self.save_button = tk.Button(button_panel, text='Save as PDF', command=self.set_output, state='disabled')
+        # ---- LEFT FRAME: Algorithm & Color selection ----
+        left_label = ttk.Label(left_frame, text="Algorithm & Color", style="TLabel")
+        left_label.pack(anchor="nw", pady=(0, 10))
 
-        self.load_button.pack(side='top', pady=10, fill='x')
-        self.save_button.pack(side='top', pady=10, fill='x')
+        # Algorithm Options
+        alg_frame = ttk.LabelFrame(left_frame, text="Pick an Algorithm:")
+        alg_frame.pack(fill="x", pady=(0, 10))
 
-        self.go_button = tk.Button(control_frame, text='Go', command=self.process_pdf,
-                                   bg="#00a884", fg="white", activebackground="#ff4d4d",
-                                   borderwidth=0, relief="flat", state='disabled')
+        cpu_button = ttk.Radiobutton(alg_frame, text="CPU - Slower, Higher Quality",
+                                     value="CPU", variable=self.algorithm_choice)
+        gpu_button = ttk.Radiobutton(alg_frame, text="GPU - Faster, Lower Quality",
+                                     value="GPU", variable=self.algorithm_choice)
+        cpu_button.pack(anchor="w", pady=2)
+        gpu_button.pack(anchor="w", pady=2)
 
-        # Calculate padding to make the button circular
-        button_size = 40  # Adjust this value to control the button size
-        padding = (button_size - self.go_button.winfo_reqwidth()) // 2
+        # Color Options
+        color_frame = ttk.LabelFrame(left_frame, text="Turn Red To:")
+        color_frame.pack(fill="x", pady=(0, 10))
 
-        self.go_button.config(padx=padding, pady=padding)
-        self.go_button.pack(side='left', padx=(10, 20))
+        white_button = ttk.Radiobutton(color_frame, text="White", value="white",
+                                       variable=self.color_choice)
+        black_button = ttk.Radiobutton(color_frame, text="Black", value="black",
+                                       variable=self.color_choice)
+        white_button.pack(anchor="w", pady=2)
+        black_button.pack(anchor="w", pady=2)
 
-        # Set a fixed width for the button based on the text "Working..."
-        self.go_button.config(width=len("Working..."))
+        # About Button
+        about_btn = ttk.Button(left_frame, text="About", command=self._show_about)
+        about_btn.pack(anchor="nw", pady=(10, 0))
+        # ---- CENTER FRAME: "Load / Save / Go" + Activity Indicator & GIF ----
+        center_controls = ttk.Frame(center_frame, style="TFrame")
+        center_controls.pack(anchor="n", pady=10, fill="x")
 
-        # Progress bar and activity indicator
-        # Configure the progress bar style with green color
-        style.configure('Green.Horizontal.TProgressbar', troughcolor=self.bg_color, background=self.button_color)
-        self.progress = ttk.Progressbar(control_frame, style='Green.Horizontal.TProgressbar', length=200,
-                                        mode='determinate')
-        self.progress.pack(side='left', padx=(10, 20))
-        # Activity indicator
-        self.activity_indicator = tk.Label(control_frame, text="Ready", font=('Helvetica', 12), bg=self.bg_color)
-        self.activity_indicator.pack(side='left', padx=10)
+        # Row 1: Load / Save
+        load_button = ttk.Button(center_controls, text="Load PDF/DOCX", command=self._on_load_click)
+        load_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
 
-        # GIF Frame with fixed size
-        gif_frame = tk.Frame(control_frame, width=250, height=250, bg=self.bg_color)
-        gif_frame.pack(side='left', padx=(10, 0))
-        gif_frame.pack_propagate(False)  # Prevent the frame from resizing
-        self.gif_label = tk.Label(gif_frame, bg=self.bg_color)
-        self.gif_label.pack(fill='both', expand=True)
-        self.gif_frames = []  # Initialize gif_frames to avoid AttributeError
-        # Preview Canvas
-        self.preview_canvas = tk.Canvas(preview_frame, bg='grey', width=595, height=842)
-        self.preview_canvas.pack(pady=10)
+        self.save_button = ttk.Button(center_controls, text="Save as PDF",
+                                      command=self._on_save_click, state="disabled")
+        self.save_button.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
+        # Row 2: Go Button
+        self.go_button = ttk.Button(center_controls, text="Go", command=self._on_go_click, state="disabled")
+        self.go_button.grid(row=1, column=0, columnspan=2, padx=5, pady=10, sticky="ew")
 
-    def update_color(self):
-        global selected_color
-        selected_color = "white" if self.color_choice.get() == "white" else "black"
+        center_controls.columnconfigure(0, weight=1)
+        center_controls.columnconfigure(1, weight=1)
 
-    def update_button_text(self):
-        while self.running:
-            self.dot_count = (self.dot_count % 3) + 1
-            text = "Working" + "." * self.dot_count
-            # No need to reconfigure the button size here as it's already fixed
-            self.go_button.config(text=text)
-            time.sleep(0.5)  # Adjust the speed of text update here
-    def on_closing(self):
-        self.running = False
-        for thread in self.threads:
-            if thread.is_alive():
-                thread.join()
-        self.destroy()
+        # Row 3: Status + Progress + GIF
+        status_frame = ttk.Frame(center_frame, style="TFrame")
+        status_frame.pack(anchor="n", fill="x")
 
+        self.status_label = ttk.Label(status_frame, text="Ready", style="TLabel")
+        self.status_label.pack(side="left", padx=5)
 
-    def show_about(self):
-        top = tk.Toplevel(self)
-        top.title("About PDF Mute")
+        self.progress_bar = ttk.Progressbar(status_frame, style="Green.Horizontal.TProgressbar",
+                                            orient="horizontal",
+                                            length=250,
+                                            mode="determinate")
+        self.progress_bar.pack(side="left", padx=5)
 
-        message = "Version: 1.1\nCreated by Amit Hacoon"
-        msg_label = tk.Label(top, text=message)
-        msg_label.pack(pady=(10, 5))
+        # Animated GIF container
+        self.gif_label = Label(status_frame, bg=self.bg_color)
+        self.gif_label.pack(side="left", padx=5)
+        self.gif_frames = []
+        self.gif_running = False
+        self.gif_index = 0
 
-        # Link to GitHub
-        link_label = tk.Label(top, text="GitHub Repository", fg="blue", cursor="hand2")
-        link_label.pack()
-        link_label.bind("<Button-1>", lambda e: webbrowser.open_new("https://github.com/amithacoon/pdfmute"))
+        # ---- RIGHT FRAME: PDF Preview Canvas ----
+        preview_lbl = ttk.Label(right_frame, text="Preview", style="TLabel")
+        preview_lbl.pack(anchor="nw", pady=(0, 5))
 
-        # Close button for the dialog
-        close_button = tk.Button(top, text="Close", command=top.destroy)
-        close_button.pack(pady=(5, 10))
+        self.preview_canvas = Canvas(right_frame, bg="#CCCCCC", width=595, height=842)
+        self.preview_canvas.pack(pady=5, padx=5)
+    # ------------------- EVENT HANDLERS ------------------- #
+    def _on_load_click(self):
+        """
+        Triggered when the user clicks "Load PDF/DOCX".
+        Allows selection of PDF, DOC, or DOCX, converting if needed, then previewing.
+        """
+        input_path = filedialog.askopenfilename(
+            filetypes=[
+                ("PDF / Word files", "*.pdf *.doc *.docx"),
+                ("PDF files", "*.pdf"),
+                ("Word files", "*.doc *.docx"),
+            ]
+        )
+        if not input_path:
+            return
 
-    def load_gif(self, gif_path):
+        ext = os.path.splitext(input_path)[1].lower()
+        if ext in (".pdf", ".doc", ".docx"):
+            try:
+                if ext == ".pdf":
+                    self.input_file = input_path
+                else:
+                    # Convert doc/docx to PDF
+                    base_name = os.path.splitext(os.path.basename(input_path))[0]
+                    temp_pdf = os.path.join(os.path.dirname(input_path), f"{base_name}_converted.pdf")
+                    convert_docx_to_pdf(input_path, temp_pdf)
+                    self.input_file = temp_pdf
+
+                self._preview_pdf(self.input_file)
+                self.save_button.config(state="normal")
+                self.status_label.config(text="Loaded successfully")
+            except Exception as e:
+                self.status_label.config(text=f"Conversion Error: {e}")
+        else:
+            self.status_label.config(text="Unsupported File Type")
+
+    def _on_save_click(self):
+        """
+        Triggered when user clicks "Save as PDF".
+        Saves the final output path.
+        """
+        if not self.input_file:
+            self.status_label.config(text="No File Loaded!")
+            return
+
+        base, _ = os.path.splitext(self.input_file)
+        default_output = base + "_MuteRed.pdf"
+
+        out_path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF Files", "*.pdf")],
+            initialfile=os.path.basename(default_output)
+        )
+        if out_path:
+            self.output_file = out_path
+            self.go_button.config(state="normal")
+            self.status_label.config(text="Ready to process")
+        else:
+            self.status_label.config(text="Save was canceled")
+
+    def _on_go_click(self):
+        """
+        Triggered when the user clicks "Go".
+        Starts the red removal process with a background thread.
+        """
+        if not (self.input_file and self.output_file):
+            self.status_label.config(text="No valid input/output")
+            return
+
+        self.status_label.config(text="Working...")
+        self.running = True
+        self.go_button.config(state="disabled")
+        self.save_button.config(state="disabled")
+        self._start_gif_animation("busy.gif")
+
+        # Start thread for red removal
+        thread_target = self._process_thread_cpu if self.algorithm_choice.get() == "CPU" else self._process_thread_gpu
+        process_thread = threading.Thread(target=thread_target, args=(self.input_file, self.output_file))
+        process_thread.daemon = True
+        process_thread.start()
+        self.threads.append(process_thread)
+
+        # Start a separate thread to update the button text with "Working..."
+        text_updater = threading.Thread(target=self._update_go_button_text, daemon=True)
+        text_updater.start()
+
+    # ------------------- RED REMOVAL THREAD WRAPPERS ------------------- #
+    def _process_thread_cpu(self, input_pdf, output_pdf):
+        """
+        Thread wrapper for CPU-based red removal.
+        """
+        try:
+            remove_red_pixels(input_pdf, output_pdf, self._update_progress, self.color_choice.get())
+            self.status_label.config(text="Done!")
+        except Exception as e:
+            self.status_label.config(text=f"Error: {e}")
+        finally:
+            self._cleanup_after_processing()
+
+    def _process_thread_gpu(self, input_pdf, output_pdf):
+        """
+        Thread wrapper for GPU-based red removal.
+        """
+        try:
+            remove_red_pixels_gpu(input_pdf, output_pdf, self._update_progress, self.color_choice.get())
+            self.status_label.config(text="Done!")
+        except Exception as e:
+            self.status_label.config(text=f"Error: {e}")
+        finally:
+            self._cleanup_after_processing()
+
+    # ------------------- GIF ANIMATION / UI UPDATES ------------------- #
+    def _start_gif_animation(self, gif_path):
+        """
+        Loads the GIF frames and starts animating them.
+        """
         self.gif_frames = []
         self.gif_index = 0
-        try:
-            self.gif = Image.open(gif_path)
-            while True:
-                self.gif_frames.append(ImageTk.PhotoImage(self.gif.copy()))
-                self.gif.seek(self.gif.tell() + 1)
-        except EOFError:
-            pass  # End of GIF file
-        except Exception as e:
-            print(f"Failed to load GIF: {e}")  # Add error logging or handling as needed
+        self.gif_running = True
 
-    def animate_gif(self):
-        if self.running:
+        try:
+            gif_img = Image.open(gif_path)
+            while True:
+                self.gif_frames.append(ImageTk.PhotoImage(gif_img.copy()))
+                gif_img.seek(gif_img.tell() + 1)
+        except EOFError:
+            pass
+        except Exception as e:
+            print(f"Failed to load GIF: {e}")
+
+        self._animate_gif()
+
+    def _animate_gif(self):
+        """
+        Recursive function that updates the gif_label with the next frame every 50ms.
+        """
+        if self.gif_running and self.gif_frames:
             frame = self.gif_frames[self.gif_index]
             self.gif_label.config(image=frame)
             self.gif_index = (self.gif_index + 1) % len(self.gif_frames)
-            # Using self.after to schedule the next frame, which is UI thread friendly
-            self.after(50, self.animate_gif)
+            self.after(50, self._animate_gif)
         else:
-            self.gif_label.config(image=None)  # Optionally clear the GIF
+            self.gif_label.config(image=None)
 
-    def animate_activity(self):
-        chars = ""
+    def _update_go_button_text(self):
+        """
+        Updates the "Go" button text to "Working...", cycling dots, while running is True.
+        """
         while self.running:
-            for char in chars:
-                if not self.running:
-                    break
-                self.activity_indicator.config(text=char)
-                self.update()
-                time.sleep(0.1)
-        self.activity_indicator.config(text=" ")  # Reset to blank when not processing
+            self.dot_count = (self.dot_count % 3) + 1
+            dots = "." * self.dot_count
+            self.go_button.config(text=f"Working{dots}")
+            time.sleep(0.5)
 
-    def load_pdf(self):
-        self.filename = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
-        if self.filename:
-            image = preview_pdf_page(self.filename)
-            self.preview_image = ImageTk.PhotoImage(image.resize((595, 842)))  # Resize for A4 proportion
-            self.preview_canvas.create_image(298, 421, image=self.preview_image)  # Center the image
-            self.save_button.config(state='normal')  # Enable save button
-
-    def set_output(self):
-        default_output_pdf = os.path.splitext(self.filename)[0] + "_MuteRed.pdf"
-        self.output_pdf = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")], initialfile=default_output_pdf)
-        if self.output_pdf:
-            self.go_button.config(state='normal')  # Enable go button
-
-    def process_pdf(self):
-        self.go_button.config(bg=self.red_color, text="Working")
-        self.running = True
-
-        # Load the GIF file and start animating it
-        self.load_gif('busy.gif')  # Ensure the correct path
-        self.animate_gif()
-
-        # Start the thread that updates the button text
-        text_update_thread = threading.Thread(target=self.update_button_text, daemon=True)
-        text_update_thread.start()
-
-        # Determine the processing function based on the chosen algorithm (CPU or GPU)
-        process_func = self.process_thread_cpu if self.algorithm.get() == 'CPU' else self.process_thread_gpu
-
-        # Start the processing thread with normal priority if possible
-        processing_thread = threading.Thread(target=process_func, args=(self.filename, self.output_pdf, selected_color))
-        processing_thread.setDaemon(True)
-        processing_thread.start()
-        self.threads.append(processing_thread)
-
-    def process_thread_cpu(self, input_pdf, output_pdf, selected_color):
-        try:
-            remove_red_pixels(input_pdf, output_pdf, self.update_progress, selected_color)
-            self.activity_indicator.config(text="Done!")  # Update text to Done when complete
-        except Exception as e:
-            self.activity_indicator.config(text="Error!")  # Show error in the activity indicator
-        finally:
-            self.running = False
-            self.save_button.config(state='normal')
-            self.go_button.config(state='normal')
-            self.gif_label.config(image='')  # Hide GIF when done
-            self.go_button.config(bg=self.button_color)
-            self.activity_indicator.config(text="Done!")  # Update text to "Done!" when complete
-            self.progress['value'] = 0  # Reset the progress bar to 0
-            self.cleanup_after_thread()
-
-        pass
-    def process_thread_gpu(self, input_pdf, output_pdf, selected_color):
-        try:
-            remove_red_pixels_gpu(input_pdf, output_pdf, self.update_progress,selected_color)
-            self.activity_indicator.config(text="Done!")  # Update text to Done when complete
-        except Exception as e:
-            self.activity_indicator.config(text="Error!")  # Show error in the activity indicator
-        finally:
-            self.running = False
-            self.save_button.config(state='normal')
-            self.go_button.config(state='normal')
-            self.gif_label.config(image='')  # Hide GIF when done
-            self.go_button.config(bg=self.button_color)
-            self.activity_indicator.config(text="Done!")  # Update text to "Done!" when complete
-            self.progress['value'] = 0  # Reset the progress bar to 0
-            self.cleanup_after_thread()
-
-        pass
-
-    def cleanup_after_thread(self):
-        self.running = False
-        self.go_button.config(bg=self.button_color, text="Go", state='normal')  # Reset button text to "Go"
-        # Any additional cleanup code
-    def update_progress(self, progress):
-        self.progress['value'] = progress
+    def _update_progress(self, value):
+        """
+        Callback to update the progress bar from 0 to 100.
+        """
+        self.progress_bar["value"] = value
         self.update_idletasks()
 
-if __name__ == '__main__':
-    app = PDFRedRemoverApp()
+    def _cleanup_after_processing(self):
+        """
+        Actions to take after finishing or failing the process.
+        """
+        self.running = False
+        self.gif_running = False
+        self.go_button.config(text="Go")
+        self.go_button.config(state="normal")
+        self.save_button.config(state="normal")
+        self._update_progress(0)
+
+    # ------------------- PREVIEW FUNCTION ------------------- #
+    def _preview_pdf(self, pdf_path):
+        """
+        Loads the first page of a PDF into the preview canvas.
+        """
+        img = preview_pdf_page(pdf_path)
+        ratio = min(595 / img.width, 842 / img.height)  # approximate A4 scaling
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+        preview_img = ImageTk.PhotoImage(img.resize(new_size, Image.ANTIALIAS))
+        self.preview_canvas.delete("all")
+        x_center = (595 - new_size[0]) // 2
+        y_center = (842 - new_size[1]) // 2
+        self.preview_canvas.create_image(x_center, y_center, anchor="nw", image=preview_img)
+        self.preview_canvas.image = preview_img  # keep a reference
+
+    # ------------------- ABOUT DIALOG ------------------- #
+    def _show_about(self):
+        """
+        Opens a 'About' window describing the app.
+        """
+        top = Toplevel(self)
+        top.title("About PDFMute v2")
+        top.geometry("300x150")
+
+        info = (
+            "PDFMute v2 - Professional Edition\n"
+            "Version: 2.0\n\n"
+            "Created by: Amit Hacoon\n"
+            "GitHub: https://github.com/amithacoon/pdfmute"
+        )
+        lbl = ttk.Label(top, text=info, justify="center")
+        lbl.pack(padx=10, pady=10)
+
+        link_btn = ttk.Button(top, text="Open GitHub", command=lambda: webbrowser.open("https://github.com/amithacoon/pdfmute"))
+        link_btn.pack()
+
+        ttk.Button(top, text="Close", command=top.destroy).pack(pady=5)
+
+    # ------------------- CLEAN EXIT ------------------- #
+    def on_closing(self):
+        """
+        Overridden method when closing the main app window.
+        """
+        self.running = False
+        self.gif_running = False
+        for t in self.threads:
+            if t.is_alive():
+                t.join()
+        self.destroy()
+
+
+# ------------- ENTRY POINT ------------- #
+if __name__ == "__main__":
+    app = PDFMuteApp()
+    app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()
-
-
