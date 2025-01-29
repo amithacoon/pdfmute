@@ -1,7 +1,5 @@
 PDFMute - PDF Red Pixel Remover 🎨🔴📜
-<p align="center">
-  <img src="https://user-images.githubusercontent.com/1234567/pdfmute-logo.png" alt="PDFMute Logo" width="200">
-</p>
+
 PDFMute is a powerful Windows application that removes unwanted red pixels from your PDF files, effectively cleaning scanned documents and images within PDFs. Say goodbye to distracting red marks and highlights with PDFMute! 🙌
 🌟 Features
 
@@ -27,10 +25,3 @@ Enjoy your red-free PDFs! 📜✨
 
 🤝 Contributing
 We welcome contributions from the community! If you have any ideas, suggestions, or bug reports, please open an issue or submit a pull request. Let's make PDFMute even better together! 😊
-📋 License
-This project is open-source and available under the MIT License.
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <a href="https://github.com/yourusername/pdfmute/stargazers"><img src="https://img.shields.io/github/stars/yourusername/pdfmute.svg" alt="GitHub stars"></a>
-</p>
