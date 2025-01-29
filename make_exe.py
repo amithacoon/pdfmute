@@ -31,10 +31,11 @@ import sys
 import time
 import threading
 import webbrowser
+import uuid
+from pathlib import Path
 
 import fitz  # PyMuPDF
 import numpy as np
-from docx2pdf import convert as docx2pdf_convert
 from PIL import Image, ImageTk
 from tkinter import Tk, Frame, Canvas, Label, Button, Toplevel, filedialog, StringVar
 from tkinter import ttk
@@ -42,6 +43,15 @@ from tkinter import ttk
 # Torch is only used in the remove_red_pixels_gpu function
 from torch import tensor, device
 from torch.cuda import is_available as cuda_is_available
+
+import tempfile
+import pythoncom
+import win32com.client
+import logging
+
+os.chdir(sys._MEIPASS)
+
+
 
 
 # ------------- RED REMOVAL LOGIC (CPU) ------------- #
@@ -166,13 +176,24 @@ def remove_red_pixels_gpu(input_pdf, output_pdf, progress_callback, color):
 
 
 # ------------- DOCX / DOC -> PDF CONVERSION ------------- #
-def convert_docx_to_pdf(input_file, output_file):
+def convert_docx_to_pdf(input_file, output_file=None):
     """
-    Convert DOC or DOCX to PDF using docx2pdf.
-    Requires Microsoft Word on Windows or fallback solution on other OS.
+    Convert DOCX to PDF, either to a temporary file or specified output path
+    Returns the path to the converted PDF file
     """
-    docx2pdf_convert(input_file, output_file)
+    try:
+        converter = DocxConverter()
+        temp_pdf = converter.convert(input_file)
 
+        if output_file:
+            import shutil
+            shutil.copy2(temp_pdf, output_file)
+            return output_file
+
+        return temp_pdf
+
+    except Exception as e:
+        raise Exception(f"Conversion failed: {str(e)}")
 
 # ------------- PDF PREVIEW ------------- #
 def preview_pdf_page(pdf_path):
@@ -191,6 +212,11 @@ def preview_pdf_page(pdf_path):
 class PDFMuteApp(Tk):
     def __init__(self):
         super().__init__()
+
+        # Add signal handlers for proper cleanup
+        import signal
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
         self.title("PDFMute v2 - Professional Edition")
         self.geometry("1250x850")
         self.minsize(1000, 700)
@@ -219,7 +245,11 @@ class PDFMuteApp(Tk):
 
         # Build main layout
         self._build_layout()
+        self.docx_converter = DocxConverter()
 
+    def _signal_handler(self, signum, frame):
+        """Handle termination signals"""
+        self.on_closing()
     # ------------------- STYLES ------------------- #
     def _configure_styles(self):
         """
@@ -352,8 +382,7 @@ class PDFMuteApp(Tk):
     # ------------------- EVENT HANDLERS ------------------- #
     def _on_load_click(self):
         """
-        Triggered when the user clicks "Load PDF/DOCX".
-        Allows selection of PDF, DOC, or DOCX, converting if needed, then previewing.
+        Triggered when user clicks "Load PDF/DOCX".
         """
         input_path = filedialog.askopenfilename(
             filetypes=[
@@ -365,42 +394,48 @@ class PDFMuteApp(Tk):
         if not input_path:
             return
 
-        ext = os.path.splitext(input_path)[1].lower()
-        if ext in (".pdf", ".doc", ".docx"):
-            try:
-                if ext == ".pdf":
-                    self.input_file = input_path
-                else:
-                    # Convert doc/docx to PDF
-                    base_name = os.path.splitext(os.path.basename(input_path))[0]
-                    temp_pdf = os.path.join(os.path.dirname(input_path), f"{base_name}_converted.pdf")
-                    convert_docx_to_pdf(input_path, temp_pdf)
-                    self.input_file = temp_pdf
+        try:
+            # שמירת הנתיב המקורי
+            self.original_file_path = input_path
 
-                self._preview_pdf(self.input_file)
-                self.save_button.config(state="normal")
-                self.status_label.config(text="Loaded successfully")
-            except Exception as e:
-                self.status_label.config(text=f"Conversion Error: {e}")
-        else:
-            self.status_label.config(text="Unsupported File Type")
+            ext = os.path.splitext(input_path)[1].lower()
+            if ext == '.pdf':
+                self.input_file = input_path
+            else:
+                # Convert DOCX/DOC to temporary PDF in a separate thread
+                self.status_label.config(text="Converting document...")
+                conversion_thread = threading.Thread(target=self._convert_docx_thread, args=(input_path,))
+                conversion_thread.start()
+                self.threads.append(conversion_thread)
 
+        except Exception as e:
+            self.status_label.config(text=f"Error: {str(e)}")
+
+
+    def _convert_docx_thread(self, input_path):
+        try:
+            self.input_file = self.docx_converter.convert(input_path)
+            self._preview_pdf(self.input_file)
+            self.save_button.config(state="normal")
+            self.status_label.config(text="Loaded successfully")
+        except Exception as e:
+            self.status_label.config(text=f"Error: {str(e)}")
     def _on_save_click(self):
         """
         Triggered when user clicks "Save as PDF".
-        Saves the final output path.
         """
         if not self.input_file:
             self.status_label.config(text="No File Loaded!")
             return
 
-        base, _ = os.path.splitext(self.input_file)
-        default_output = base + "_MuteRed.pdf"
+        # Get original file name without extension
+        original_name = os.path.splitext(os.path.basename(self.original_file_path))[0]
+        default_output = f"{original_name}_MuteRed.pdf"
 
         out_path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF Files", "*.pdf")],
-            initialfile=os.path.basename(default_output)
+            initialfile=default_output
         )
         if out_path:
             self.output_file = out_path
@@ -408,7 +443,6 @@ class PDFMuteApp(Tk):
             self.status_label.config(text="Ready to process")
         else:
             self.status_label.config(text="Save was canceled")
-
     def _on_go_click(self):
         """
         Triggered when the user clicks "Go".
@@ -514,13 +548,18 @@ class PDFMuteApp(Tk):
         """
         Actions to take after finishing or failing the process.
         """
-        self.running = False
-        self.gif_running = False
-        self.go_button.config(text="Go")
-        self.go_button.config(state="normal")
-        self.save_button.config(state="normal")
-        self._update_progress(0)
-
+        try:
+            self.running = False
+            self.gif_running = False
+            if hasattr(self, 'go_button'):
+                self.go_button.config(text="Go")
+                self.go_button.config(state="normal")
+            if hasattr(self, 'save_button'):
+                self.save_button.config(state="normal")
+            if hasattr(self, 'progress_bar'):
+                self._update_progress(0)
+        except:
+            pass
     # ------------------- PREVIEW FUNCTION ------------------- #
     def _preview_pdf(self, pdf_path):
         """
@@ -564,16 +603,205 @@ class PDFMuteApp(Tk):
         """
         Overridden method when closing the main app window.
         """
-        self.running = False
-        self.gif_running = False
-        for t in self.threads:
-            if t.is_alive():
-                t.join()
-        self.destroy()
+        try:
+            # Clean up temp files
+            import tempfile
+            from pathlib import Path
+            temp_dir = Path(tempfile.gettempdir()) / 'pdfmute_temp'
+            if temp_dir.exists():
+                import shutil
+                shutil.rmtree(temp_dir)
+
+            # Stop running processes
+            self.running = False
+            self.gif_running = False
+            for t in self.threads:
+                if t.is_alive():
+                    t.join(timeout=1.0)
+
+            self.destroy()
+
+        except:
+            self.destroy()
 
 
+import os
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+import pythoncom
+import win32com.client
+import logging
+
+class DocxConverter:
+    def __init__(self):
+        self.temp_dir = Path(tempfile.gettempdir()) / 'pdfmute_temp'
+        self.temp_dir.mkdir(exist_ok=True)
+
+        # Setup logging
+        self.logger = logging.getLogger('DocxConverter')
+        self.logger.setLevel(logging.DEBUG)
+
+        if not self.logger.handlers:
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            log_file = self.temp_dir / 'conversion.log'
+            file_handler = logging.FileHandler(str(log_file), encoding='utf-8')
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+
+        pythoncom.CoInitialize()
+        self.logger.info("COM Initialized successfully")
+
+    def _convert_single_file(self, word_app, input_path, output_path):
+        """Single conversion attempt with detailed error logging"""
+        self.logger.debug(f"Starting single file conversion")
+        self.logger.debug(f"Input exists: {os.path.exists(input_path)}")
+
+        doc = None
+        try:
+            self.logger.debug("Attempting to open document")
+            try:
+                doc = word_app.Documents.Open(
+                    FileName=str(input_path),
+                    ReadOnly=1,  # Use numeric value instead of constants.wdReadOnly
+                    Visible=0,  # Use numeric value instead of constants.wdFalse
+                    ConfirmConversions=0  # Use numeric value instead of constants.wdFalse
+                )
+                self.logger.info("Document opened successfully")
+            except Exception as e:
+                self.logger.error(f"Error opening document: {str(e)}")
+                raise
+
+            time.sleep(1)  # Allow document to load
+
+            self.logger.debug("Attempting to save as PDF")
+            try:
+                doc.SaveAs(
+                    FileName=str(output_path),
+                    FileFormat=17,  # Use numeric value instead of constants.wdFormatPDF
+                    AddToRecentFiles=0  # Use numeric value instead of constants.wdFalse
+                )
+                self.logger.info("Document saved as PDF")
+            except Exception as e:
+                self.logger.error(f"Error saving document as PDF: {str(e)}")
+                raise
+
+            time.sleep(1)  # Allow save to complete
+
+            # Verify the output file exists
+            if os.path.exists(output_path):
+                self.logger.info("Output file created successfully")
+                return True
+            else:
+                self.logger.error("Output file was not created")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error during conversion: {str(e)}")
+            raise
+
+        finally:
+            if doc:
+                try:
+                    self.logger.debug("Attempting to close document")
+                    doc.Close(SaveChanges=0)  # Use numeric value instead of constants.wdDoNotSaveChanges
+                    self.logger.debug("Document closed")
+                except Exception as e:
+                    self.logger.error(f"Error closing document: {str(e)}")
+
+            # Additional cleanup
+            try:
+                self.logger.debug("Attempting to quit Word application")
+                word_app.Quit()
+                self.logger.debug("Word application quit")
+            except Exception as e:
+                self.logger.error(f"Error quitting Word application: {str(e)}")
+
+            # Wait for Word process to fully terminate
+            time.sleep(2)
+
+    def convert(self, input_file):
+        """Convert with retry logic and detailed logging"""
+        self.logger.info(f"Starting conversion process for {input_file}")
+
+        try:
+            input_path = Path(input_file).resolve()
+            temp_pdf = self.temp_dir / f"{uuid.uuid4()}.pdf"
+
+            self.logger.debug(f"Using temp file: {temp_pdf}")
+
+            if not input_path.exists():
+                self.logger.error(f"Input file not found: {input_path}")
+                raise FileNotFoundError(f"Input file not found: {input_path}")
+
+            # Check for crashed Word instances and close them
+            self.logger.debug("Checking for crashed Word instances")
+            self._close_crashed_word_instances()
+
+            self.logger.debug("Creating Word application")
+            word = win32com.client.DispatchEx('Word.Application')
+            word.Visible = False
+            word.DisplayAlerts = False
+
+            # Check if Word application is properly initialized
+            try:
+                word.Documents.Count
+            except Exception as e:
+                self.logger.error(f"Error initializing Word application: {str(e)}")
+                raise
+
+            max_retries = 3
+            retry_delay = 1
+
+            for attempt in range(max_retries):
+                try:
+                    self.logger.info(f"Conversion attempt {attempt + 1} of {max_retries}")
+
+                    if self._convert_single_file(word, input_path, temp_pdf):
+                        self.logger.info("Conversion successful")
+                        return str(temp_pdf)
+
+                except Exception as e:
+                    self.logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
+                    if attempt == max_retries - 1:
+                        raise
+
+                    self.logger.info(f"Waiting {retry_delay} seconds before retry")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+
+                finally:
+                    try:
+                        word.Quit()
+                        self.logger.debug("Word application closed")
+                    except Exception as e:
+                        self.logger.error(f"Error closing Word: {str(e)}")
+
+        except Exception as e:
+            self.logger.error(f"Conversion failed: {str(e)}")
+            raise Exception(f"Conversion error: {str(e)}")
+
+    def _close_crashed_word_instances(self):
+        """Close crashed Word instances"""
+        import psutil
+
+        for proc in psutil.process_iter():
+            try:
+                if proc.name().lower() == "winword.exe":
+                    if proc.status() == psutil.STATUS_ZOMBIE or proc.status() == psutil.STATUS_DEAD:
+                        self.logger.debug(f"Closing crashed Word process with PID: {proc.pid}")
+                        proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
 # ------------- ENTRY POINT ------------- #
 if __name__ == "__main__":
-    app = PDFMuteApp()
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloop()
+    try:
+        app = PDFMuteApp()
+        app.protocol("WM_DELETE_WINDOW", app.on_closing)
+        app.mainloop()
+    except Exception as e:
+        print(f"Error: {e}")
+        import os
+        os._exit(1)
